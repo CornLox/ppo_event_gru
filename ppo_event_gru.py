@@ -4,7 +4,7 @@
 #   "The 37 Implementation Details of Proximal Policy Optimization"
 #   (Huang et al., ICLR Blog Track 2022; CleanRL's ppo_atari_lstm.py),
 # with a *swappable recurrent core* selected by
-#   --recurrent-core {lstm, gru, mgu, evlstm, evgru, evmgu}:
+#   --recurrent-core {lstm, gru, mgu, evlstm, evlstm_c, evgru, evmgu}:
 #   * lstm   : the standard LSTM core, exactly as in the post.
 #   * gru    : the standard GRU core (nn.GRU), same init convention as `lstm`.
 #   * mgu    : the Minimal Gated Unit (Zhou et al., "Minimal Gated Unit for
@@ -15,18 +15,25 @@
 #              "Efficient Recurrent Architectures Through Activity Sparsity and
 #               Sparse Back-Propagation Through Time" (Subramoney et al.,
 #               ICLR 2023 / EGRU) grafted on, so it differs from `lstm` ONLY in
-#               the sparsity. The paper itself applies the mechanism to a GRU.
+#               the sparsity. The mechanism is applied to the gated output h^,
+#               which is thresholded/emitted while the cell c is depleted by it.
+#   * evlstm_c: the cell-consistent event LSTM. Same graft, but the event is
+#              thresholded, emitted, AND reset on the cell c itself (the LSTM's one
+#              true accumulator), then output-gated for communication. Fixes the
+#              evlstm asymmetry of thresholding one vector (h^) but depleting
+#              another (c); stays genuinely two-state (does not collapse to EGRU).
 #   * evgru  : the canonical EGRU -- the SAME activity-sparsity mechanism on its
 #              native GRU backbone, i.e. the model the paper actually proposes.
 #   * evmgu  : the SAME activity-sparsity mechanism on the MGU backbone, i.e. the
 #              event twin of `mgu` (single forget gate + EGRU sparsity), the MGU
 #              analogue of evgru.
 #
-# The three event cores (evlstm, evgru, evmgu) share a single sparsity
+# The four event cores (evlstm, evlstm_c, evgru, evmgu) share a single sparsity
 # implementation (thresholded events, sparse recurrence, reset-by-subtraction,
 # surrogate-gradient BPTT), so comparing them isolates the recurrent backbone;
 # comparing each event core against its dense twin (lstm / gru / mgu) isolates the
-# sparsity mechanism.
+# sparsity mechanism. evlstm vs evlstm_c additionally isolates WHERE the event
+# acts within the LSTM's two states (gated output vs cell accumulator).
 #
 # The default environment is Breakout (BreakoutNoFrameskip-v4) with the exact
 # Atari preprocessing + Nature-CNN encoder from ppo_atari_lstm.py. The encoder
@@ -104,13 +111,15 @@ def parse_args():
 
     # --- recurrent core selection ---
     p.add_argument("--recurrent-core", type=str, default="evmgu",
-                   choices=["lstm", "gru", "mgu", "evlstm", "evgru", "evmgu"],
+                   choices=["lstm", "gru", "mgu", "evlstm", "evlstm_c", "evgru", "evmgu"],
                    help="lstm   ('37 details' baseline LSTM core) | "
                         "gru    (traditional GRU core) | "
                         "mgu    (Minimal Gated Unit: GRU with its reset+update gates "
                         "merged into a single forget gate, Zhou et al. 2016) | "
                         "evlstm (event LSTM: LSTM gating + the EGRU activity-sparsity "
-                        "mechanism grafted on) | "
+                        "mechanism grafted on the gated output h^) | "
+                        "evlstm_c (cell-consistent event LSTM: the event is thresholded, "
+                        "emitted, and reset on the cell c itself, then output-gated) | "
                         "evgru  (event GRU: the canonical EGRU -- GRU gating + the "
                         "same activity-sparsity mechanism) | "
                         "evmgu  (event MGU: MGU gating + the same activity-sparsity "
@@ -122,7 +131,7 @@ def parse_args():
     # folder. FALSE -> a single run with the selected --recurrent-core.
     p.add_argument("--sweep-all-cores", type=lambda x: x.lower() == "true", default=False,
                    help="TRUE -> run a full training run for every core "
-                        "(lstm, evlstm, gru, evgru, mgu, evmgu) sequentially, saving "
+                        "(lstm, evlstm, evlstm_c, gru, evgru, mgu, evmgu) sequentially, saving "
                         "each core's parameters under models/. FALSE -> one run with "
                         "--recurrent-core (default).")
     p.add_argument("--encoder-hidden", type=int, default=64,
@@ -449,6 +458,118 @@ class EventLSTMCore(nn.Module):
         return y, (y.unsqueeze(0), c.unsqueeze(0))
 
 
+class EventLSTMCellCore(nn.Module):
+    """Event-based LSTM, *cell-consistent* variant (evlstm_c). Same goal as
+    EventLSTMCore -- graft the EGRU activity-sparsity mechanism onto an LSTM -- but
+    fixing the one place where EventLSTMCore is not faithful to the EGRU recipe.
+
+    The motivation: an LSTM has exactly ONE true accumulator, the cell c; the
+    hidden output h = o*tanh(c) is not a persisted state, it is recomputed every
+    step from c. Reset-by-subtraction only makes sense on something that
+    accumulates, so a self-consistent event mechanism must live on the cell.
+    EventLSTMCore instead thresholds the gated output h^_t but subtracts the
+    resulting event from the cell c -- it thresholds one vector and depletes a
+    different one. This core thresholds, emits, and resets the SAME vector (the
+    cell), exactly like EGRU's single internal state, and then output-gates the
+    event for communication.
+
+    Per-step equations (standard LSTM gating, then a cell-side event):
+        i,f,g,o = gates(x_t, y_{t-1})
+        c~_t    = f_t ⊙ c_{t-1} + i_t ⊙ g_t           # accumulate (dense)
+        s_t     = H(c~_t - θ) - H(-c~_t - θ)           # threshold the CELL  {-1,0,+1}
+        e_t     = c~_t ⊙ |s_t|                          # signed graded event ON THE CELL
+        c_t     = c~_t - e_t                            # reset-by-subtraction, SAME vector
+        y_t     = o_t ⊙ tanh(e_t)                       # output-gated sparse readout
+
+    Two design points that make this work cleanly:
+      (a) y_t reads tanh(e_t), NOT tanh(c_t). After the reset, c_t is exactly 0 at
+          the units that fired (c~_t - c~_t), so tanh(c_t) would null the very
+          signal we want to emit. Using the event e_t keeps the fired magnitude.
+      (b) y_t inherits the cell's sparsity for free: e_t is 0 wherever the cell was
+          silent, so tanh(e_t)=0 there and the output gate cannot resurrect it --
+          sparse recurrence with a SINGLE threshold (on the cell), no second one.
+
+    State = (y, c), same (output, accumulator) layout as EventLSTMCore and the
+    other event cores, so done-masking, the activity reg, and threshold logging are
+    unchanged. The reset here is *immediate* (subtract the current event e_t), which
+    keeps the reset at full strength; EGRU's GRU formulation folds the *previous*
+    event into the update, where the next forget gate re-scales it. For an LSTM the
+    immediate form is the natural choice (the reset is not re-gated), so it is the
+    one implemented here. Crucially, y_t is NOT reconstructible from the stored c_t
+    alone (post-reset c_t is 0 at fired units, and o_t depends on the unstored
+    y_{t-1}, x_t), so this core stays genuinely two-state -- it sparsifies the LSTM
+    consistently rather than collapsing it onto EGRU's single-state structure.
+    """
+
+    def __init__(self, in_dim, hidden, threshold_init, eps, scale, sparse, learn_threshold,
+                 softplus_threshold=False):
+        super().__init__()
+        self.hidden = hidden
+        self.eps = eps
+        self.scale = scale
+        self.sparse = sparse
+        self.use_softplus = softplus_threshold
+        self.last_activity = 0.0  # logged: fraction of units that fired last step
+        # differentiable (B,H) firing mask, for the activity reg
+        self.last_fire = None
+
+        # Identical init to EventLSTMCore (orthogonal weights, zero bias) so the
+        # only difference between the two LSTM event cores is WHERE the event acts
+        # (cell vs gated output), not the parameterization. [37-LSTM #2]
+        self.x2h = layer_init(nn.Linear(in_dim, 4 * hidden),
+                              std=1.0)   # [i, f, g, o] from x
+        # recurrent, on sparse y
+        self.y2h = nn.Linear(hidden, 4 * hidden, bias=False)
+        nn.init.orthogonal_(self.y2h.weight, 1.0)
+
+        raw = inverse_softplus(
+            threshold_init) if softplus_threshold else float(threshold_init)
+        thr = torch.full((hidden,), raw)
+        self.threshold = nn.Parameter(thr, requires_grad=learn_threshold)
+
+    def theta(self):
+        # softplus keeps the threshold (and thus the dead-zone) non-negative
+        return nn.functional.softplus(self.threshold) if self.use_softplus else self.threshold
+
+    def initial_state(self, batch, device):
+        return (torch.zeros(1, batch, self.hidden, device=device),   # y (events / output)
+                torch.zeros(1, batch, self.hidden, device=device))   # c (cell)
+
+    def step(self, x_t, state):
+        y_prev = state[0].squeeze(0)   # (B, H)  sparse event/output from last step
+        c_prev = state[1].squeeze(0)   # (B, H)  cell accumulator
+
+        i, f, g, o = (self.x2h(x_t) + self.y2h(y_prev)).chunk(4, dim=-1)
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        g = torch.tanh(g)
+        o = torch.sigmoid(o)
+
+        # cell accumulation (standard LSTM)
+        c = f * c_prev + i * g
+        # Balanced-ternary (bipolar) event on the CELL: a unit fires +1 above
+        # +vartheta and -1 below -vartheta, silent in the symmetric dead-zone. Same
+        # surrogate Heaviside as the other event cores; the +vartheta branch alone
+        # recovers a one-sided unit.
+        theta = self.theta()
+        pos = heaviside_surrogate(
+            c - theta, self.eps, self.scale, self.sparse)   # {0,1} fired high
+        neg = heaviside_surrogate(
+            -c - theta, self.eps, self.scale, self.sparse)  # {0,1} fired low
+        # {0,1}: fired on either polarity
+        fire = pos + neg
+        e = c * fire                            # signed graded event on the cell
+        c = c - e                               # reset-by-subtraction (same vector)
+        # output-gated sparse readout; tanh(e) (not tanh(c)) so fired magnitude
+        # survives the reset, and is 0 wherever the cell was silent -> y stays sparse
+        y = o * torch.tanh(e)
+
+        # differentiable, consumed by the activity reg
+        self.last_fire = fire
+        self.last_activity = float(fire.detach().mean().item())
+        return y, (y.unsqueeze(0), c.unsqueeze(0))
+
+
 class EventGRUCore(nn.Module):
     """Event-based GRU -- the *canonical* EGRU (Subramoney et al., ICLR 2023):
     the activity-sparsity mechanism on its native GRU backbone. This is the model
@@ -673,6 +794,14 @@ def make_core(name, in_dim, hidden, args):
                              sparse=args.event_sparse_bptt,
                              learn_threshold=args.learn_threshold,
                              softplus_threshold=args.event_softplus_threshold)
+    if name == "evlstm_c":
+        return EventLSTMCellCore(in_dim, hidden,
+                                 threshold_init=args.event_threshold_init,
+                                 eps=args.event_surrogate_width,
+                                 scale=args.event_surrogate_scale,
+                                 sparse=args.event_sparse_bptt,
+                                 learn_threshold=args.learn_threshold,
+                                 softplus_threshold=args.event_softplus_threshold)
     if name == "evgru":
         return EventGRUCore(in_dim, hidden,
                             threshold_init=args.event_threshold_init,
@@ -695,7 +824,7 @@ def make_core(name, in_dim, hidden, args):
 def is_event_core(name):
     """True for cores carrying the EGRU activity-sparsity machinery (trainable
     threshold + a `last_activity` readout to log)."""
-    return name in ("evlstm", "evgru", "evmgu")
+    return name in ("evlstm", "evlstm_c", "evgru", "evmgu")
 
 
 # ===========================================================================
@@ -854,7 +983,7 @@ def save_model(agent, optimizer, args, global_step, run_name):
     mirroring the runs/{run_name} TensorBoard folder so each core's checkpoint
     sits beside its logs. Called at the end of every run; after a single
     --sweep-all-cores invocation the models/ folder holds one checkpoint per core
-    (lstm, evlstm, gru, evgru, mgu, evmgu). The env id can contain a '/', so the
+    (lstm, evlstm, evlstm_c, gru, evgru, mgu, evmgu). The env id can contain a '/', so the
     parent directory is created before saving (e.g. models/ALE/...)."""
     model_path = f"models/{run_name}.pt"
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
@@ -1148,7 +1277,7 @@ def main():
     if args.sweep_all_cores:
         # one full run per core, dense/event paired, sharing seed + hyperparameters
         # so the only thing that changes between runs is the recurrent backbone.
-        for core in ["lstm", "evlstm", "gru", "evgru", "mgu", "evmgu"]:
+        for core in ["lstm", "evlstm", "evlstm_c", "gru", "evgru", "mgu", "evmgu"]:
             args.recurrent_core = core
             print(f"\n===== sweep-all-cores: training recurrent-core={core} =====")
             train(args)
